@@ -27,37 +27,79 @@ class KOALAnet(nn.module):
     def forward(self, x):
         return x
 
+#### Coding now ...
+class LocalConvDs(nn.module):
+    def __init__(self, ch, k_sz):
+        super(LocalConvDs, self).__init__()
+        self.ch = ch
+        self.k_sz = k_sz
+        self.image_patches = ExtractSplitStackImagePatches(k_sz, k_sz)
+
+    def forward(self, img, kernel_2d):
+        # local filtering operation for features
+        # img: [B, C, H, W]
+        # kernel_2d: [B, kernel*kernel, H, W]
+        img = self.image_patches(img) # [B, C*kh*kw, H, W]
+        img = torch.split(img, self.k_sz**2, dim=1) # kh*kw of [B, C, H, W]
+        img = torch.stack(img, dim=2) # [B, C, kh*kw, H, W]
+    
+        k_dim = kernel_2d.size()
+        kernel_2d = kernel_2d.unsqueeze(1).expand(k_dim[0], self.ch, *k_dim[1:]).contiguous() # [B, C, kh*kw, H, W]
+
+        y = torch.sum(img * kernel_2d, dim=2) # [B, C, kh*kw, H, W] -> [B, C, H, W]
+        return y
 
 ## ============= UpwnsamplingNtowrk =============
 
-class UpsamplingNetwork(nn.module):
-    def __init__(self, in_ch, ds_blur_k_sz, us_blur_k_sz, factor, out_ch=3):
-        super(UpsamplingNetwork, self).__init__()
-        md_ch = 64
-        n_koala = 5
-        n_res = 7
-        
-        self.cor_ker_block = CorrectKernelBlock(ds_blur_k_sz**2, md_ch, 3)
+class UpsamplingNetworkBaseline(nn.module):
+    def __init__(self, in_ch, us_blur_k_sz, factor, out_ch=3):
+        super(UpsamplingNetworkBaseline, self).__init__()
+        self.md_ch = 64
+        self.n_koala = 5
+        self.n_res = 7
 
-        self.conv1 = nn.Conv2d(in_ch, md_ch, kernel_size=3, padding=1)
-        self.koala_modules = nn.Sequential([KOALAModlule(md_ch, md_ch, covn_k_sz=3, lc_k_sz=7) for i in range(n_koala)])
-        self.res_blocks = nn.Sequential([ResBlock(md_ch, md_ch, 3) for i in range(n_res)])
+        self.conv1 = nn.Conv2d(in_ch, self.md_ch, kernel_size=3, padding=1)
+        self.res_blocks_alt = nn.Sequential([ResBlock(self.md_ch, self.md_ch, 3) for i in range(self.n_koala)])
+        self.res_blocks = nn.Sequential([ResBlock(self.md_ch, self.md_ch, 3) for i in range(self.n_res)])
         self.relu = nn.ReLU(inplace=True)
         self.upsampling_kernel_branch = nn.Sequential(
-                                            nn.Conv2d(md_ch, md_ch * 2, 3, padding=1),
+                                            nn.Conv2d(self.md_ch, self.md_ch * 2, 3, padding=1),
                                             nn.ReLU(inplace=False),
-                                            nn.Conv2d(md_ch * 2, us_blur_k_sz ** 2 * factor ** 2, 3, padding=1),
+                                            nn.Conv2d(self.md_ch * 2, us_blur_k_sz ** 2 * factor ** 2, 3, padding=1),
                                             )
         img_branch_layers = []
         for i in range(int(np.log2(factor))):
-            img_branch_layers += [nn.Conv2d(md_ch, md_ch * 2, 3, padding=1),
+            img_branch_layers += [nn.Conv2d(self.md_ch, self.md_ch * 2, 3, padding=1),
                                   nn.ReLU(inplace=False),
                                   nn.PixelShuffle(2),
                                   ]
         self.rgb_res_img_branch = nn.Sequential(*img_branch_layers,
-                                                nn.Conv2d(md_ch, out_ch, 3, padding=1),
+                                                nn.Conv2d(self.md_ch, out_ch, 3, padding=1),
                                                 )
         self.local_conv_us = LocalConvUs()
+
+    def forward(self, x, k2d_ds, factor, kernel, channels=3):
+        # extract degradation kernel features
+        filter_koala_list = []
+        h = self.conv1(x)
+        h = self.res_blocks_alt(h)
+        h = self.relu(self.res_blocks(h))
+        # upsampling kernel branch
+        k2d = self.upsampling_kernel_branch(h)
+        # rgb residual image branch
+        rgb = self.rgb_res_img_branch(h)
+        # local filtering and upsampling
+        output_k2d = self.local_conv_us(k2d)
+        output = output_k2d + rgb
+
+        return output
+
+
+class UpsamplingNetwork(UpsamplingNetworkBaseline):
+    def __init__(self, in_ch, ds_blur_k_sz, lc_blur_k_sz, us_blur_k_sz, factor, out_ch=3):
+        super(UpsamplingNetwork, self).__init__(in_ch, us_blur_k_sz, factor, out_ch)
+        self.cor_ker_block = CorrectKernelBlock(ds_blur_k_sz**2, self.md_ch, 3)
+        self.koala_modules = nn.Sequential([KOALAModlule(self.md_ch, self.md_ch, covn_k_sz=3, lc_k_sz=lc_blur_k_sz) for i in range(self.n_koala)])
 
     def forward(self, x, k2d_ds, factor, kernel, channels=3):
         # extract degradation kernel features
@@ -74,7 +116,7 @@ class UpsamplingNetwork(nn.module):
         output_k2d = self.local_conv_us(k2d)
         output = output_k2d + rgb
 
-        return output
+        return output, filter_koala_list[-1]
 
 
 class KOALAModlule(nn.module):
