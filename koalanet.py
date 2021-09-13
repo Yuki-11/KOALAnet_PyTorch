@@ -121,17 +121,90 @@ class CorrectKernelBlock(nn.module):
 
 
 class LocalConvUs(nn.module):
-    def __init__(self, ch, k_sz):
+    def __init__(self, ch, k_sz, factor):
         super(LocalConvUs, self).__init__()
+        self.ch = ch
+        self.k_sz = k_sz
+        self.image_patches = ExtractSplitStackImagePatches(k_sz, k_sz)
+        self.factor = factor
+        self.kernel_norm = KernelNormalize(k_sz)
+        self.pixel_shuffle = nn.PixelShuffle(factor)
+
+    def forward(self, img, kernel_2d):
+        # local filtering operation for upsampling network
+        # img: [B, C, H, W]
+        # kernel_2d: [B, k_sz*k_sz*factor*factor, H, W]
+        img = self.image_patches(img) # [B, C*kh*kw, H, W]
+        img = torch.split(img, self.k_sz**2, dim=1) # kh*kw of [B, C, H, W]
+        img = torch.stack(img, dim=2) # [B, C, kh*kw, H, W]
+        img_dim = img.size()
+        img_dim[1] *= self.factor * 2
+        img = img.expand(*img_dim).contiguous() # [B, C*factor**2, kh*kw, H, W]
+
+        kernel_2d = torch.split(kernel_2d, self.k_sz**2, dim=1) # kh*kw of [B, factor**2, H, W]
+        kernel_2d = torch.stack(kernel_2d, dim=2) # [B, factor**2, kh*kw, H, W]
+        kernel_2d = self.kernel_norm(kernel_2d, dim=2) # [B, factor**2, kh*kw, H, W]
+        k_dim = kernel_2d.size()
+        kernel_2d = kernel_2d.unsqueeze(1).expand(k_dim[0], self.ch, *k_dim[1:]).contiguous() # [B, C, factor**2, kh*kw, H, W]
+        kernel_2d = torch.unbind(kernel_2d, dim=2) # factor**2 of [B, C, kh*kw, H, W]
+        kernel_2d = torch.cat(kernel_2d, dim=1) # [B, C*factor**2, kh*kw, H, W]
+
+        result = torch.sum(img * kernel_2d, dim=2) # [B, C*factor**2, kh*kw, H, W] -> [B, C*factor**2, H, W]
+        result = self.pixel_shuffle(result) # [B, C*factor**2, H, W] -> [B, C, H*factor, W*factor]
+        return result
+
+
+class LocalConvFeat(nn.module):
+    def __init__(self, ch, k_sz):
+        super(LocalConvFeat, self).__init__()
         self.ch = ch
         self.k_sz = k_sz
         self.image_patches = ExtractSplitStackImagePatches(k_sz, k_sz)
 
     def forward(self, img, kernel_2d):
-        kernel_2d = kernel_2d.expand(-1, self.ch).permute(0, 3, 1, 2).contiguous()
-        img = self.image_patches(img)
-        y = torch.sum(img * kernel_2d, dim=2) # [B, C, kh*hw, H, W] -> [B, C, H, W]
+        # local filtering operation for features
+        # img: [B, C, H, W]
+        # kernel_2d: [B, kernel*kernel, H, W]
+        img = self.image_patches(img) # [B, C*kh*kw, H, W]
+        img = torch.split(img, self.k_sz**2, dim=1) # kh*kw of [B, C, H, W]
+        img = torch.stack(img, dim=2) # [B, C, kh*kw, H, W]
+    
+        k_dim = kernel_2d.size()
+        kernel_2d = kernel_2d.unsqueeze(1).expand(k_dim[0], self.ch, *k_dim[1:]).contiguous() # [B, C, kh*kw, H, W]
+
+        y = torch.sum(img * kernel_2d, dim=2) # [B, C, kh*kw, H, W] -> [B, C, H, W]
         return y
+
+
+class ExtractSplitStackImagePatches(nn.module):
+    def __init__(self, kh, kw, padding="same"):
+        super(ExtractSplitStackImagePatches, self).__init__()
+        # stride = 1
+        self.k_sz = [kh, kw]
+        if padding == 'same':
+            self.pad = [(kw - 1)/2 for i in range(2)] + [(kh - 1)/2 for i in range(2)]
+        else:
+            self.pad = [0, 0]
+        self.stride = [1, 1]
+
+    def forward(self, x):
+        # https://discuss.pytorch.org/t/tf-extract-image-patches-in-pytorch/43837/8
+        x = F.pad(x, self.pad)
+        patches = x.unfold(2, self.k_sz[0], self.stride[0]).unfold(3, self.k_sz[1], self.stride[1])
+        patches = patches.permute(0, 1, 4, 5, 2, 3).contiguous() # [B, C, kh, kw, H, W]
+        patches = patches.view(*patches.size()[0], -1, *patches.size()[4:]) # [B, C*kh*kw, H, W]
+        return patches
+
+
+class KernelNormalize(nn.module):
+    def __init__(self, k_sz):
+        super(KernelNormalize, self).__init__()
+        self.k_sz = k_sz
+
+    def forward(self, kernel_2d, dim=1):
+        kernel_2d = kernel_2d - torch.mean(kernel_2d, dim, True)
+        kernel_2d = kernel_2d + 1.0 / (self.k_sz ** 2)
+        return kernel_2d
 
 
 ## ============= DownsamplingNtowrk =============
@@ -219,6 +292,8 @@ class DecBlock(nn.module):
         return y
 
 
+# ================= CommonModule ======================
+
 class ResBlock(nn.module):
     def __init__(self, in_ch, out_ch, k_sz):
         super(ResBlock, self).__init__()
@@ -233,47 +308,5 @@ class ResBlock(nn.module):
         return y+x
 
 
-class KernelNormalize(nn.module):
-    def __init__(self, k_sz):
-        super(KernelNormalize, self).__init__()
-        self.k_sz = k_sz
 
-    def forward(self, kernel_2d):
-        kernel_2d = kernel_2d - torch.mean(kernel_2d, 3, True)
-        kernel_2d = kernel_2d + 1.0 / (self.k_sz ** 2)
-        return kernel_2d
-
-
-class LocalConvFeat(nn.module):
-    def __init__(self, ch, k_sz):
-        super(LocalConvFeat, self).__init__()
-        self.ch = ch
-        self.k_sz = k_sz
-        self.image_patches = ExtractSplitStackImagePatches(k_sz, k_sz)
-
-    def forward(self, img, kernel_2d):
-        kernel_2d = kernel_2d.expand(-1, self.ch).permute(0, 3, 1, 2).contiguous()
-        img = self.image_patches(img)
-        y = torch.sum(img * kernel_2d, dim=2) # [B, C, kh*hw, H, W] -> [B, C, H, W]
-        return y
-
-
-class ExtractSplitStackImagePatches(nn.module):
-    def __init__(self, kh, kw, padding="same"):
-        super(ExtractSplitStackImagePatches, self).__init__()
-        # stride = 1
-        self.k_sz = [kh, kw]
-        if padding == 'same':
-            self.pad = [(kw - 1)/2 for i in range(2)] + [(kh - 1)/2 for i in range(2)]
-        else:
-            self.pad = [0, 0]
-        self.stride = [1, 1]
-
-    def forward(self, x):
-        # https://discuss.pytorch.org/t/tf-extract-image-patches-in-pytorch/43837/8
-        x = F.pad(x, self.pad)
-        patches = x.unfold(2, self.k_sz[0], self.stride[0]).unfold(3, self.k_sz[1], self.stride[1])
-        patches = patches.permute(0, 1, 4, 5, 2, 3).contiguous() # [B, C, kh, hw, H, W]
-        patches = patches.view(*patches.size()[:2], -1, *patches.size()[4:]) # [B, C, kh*hw, H, W]
-        return patches
 
