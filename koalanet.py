@@ -2,6 +2,7 @@ import torch
 import torchvision
 import torch.nn.functional as F
 from torch import nn
+import numpy as np
 
 
 def initialize_weights(*models):
@@ -16,6 +17,9 @@ def initialize_weights(*models):
                 module.bias.data.zero_()
 
 
+## ============= KOALAnet =============
+
+
 class KOALAnet(nn.module):
     def __init__(self):
         super(KOALAnet, self).__init__()
@@ -24,8 +28,10 @@ class KOALAnet(nn.module):
         return x
 
 
+## ============= UpwnsamplingNtowrk =============
+
 class UpsamplingNetwork(nn.module):
-    def __init__(self, in_ch, out_ch, ds_blur_k_sz, us_blur_k_sz, factor):
+    def __init__(self, in_ch, ds_blur_k_sz, us_blur_k_sz, factor, out_ch=3):
         super(UpsamplingNetwork, self).__init__()
         md_ch = 64
         n_koala = 5
@@ -42,11 +48,16 @@ class UpsamplingNetwork(nn.module):
                                             nn.ReLU(inplace=False),
                                             nn.Conv2d(md_ch * 2, us_blur_k_sz ** 2 * factor ** 2, 3, padding=1),
                                             )
-        self.rgb_res_img_branch = nn.Sequential(
-                                            nn.Conv2d(md_ch, md_ch * 2, 3, padding=1),
-                                            nn.ReLU(inplace=False),
-                                            nn.Conv2d(md_ch, us_blur_k_sz**2*factor**2, 3, padding=1),
-                                            )
+        img_branch_layers = []
+        for i in range(int(np.log2(factor))):
+            img_branch_layers += [nn.Conv2d(md_ch, md_ch * 2, 3, padding=1),
+                                  nn.ReLU(inplace=False),
+                                  nn.PixelShuffle(2),
+                                  ]
+        self.rgb_res_img_branch = nn.Sequential(*img_branch_layers,
+                                                nn.Conv2d(md_ch, out_ch, 3, padding=1),
+                                                )
+        self.local_conv_us = LocalConvUs()
 
     def forward(self, x, k2d_ds, factor, kernel, channels=3):
         # extract degradation kernel features
@@ -56,12 +67,14 @@ class UpsamplingNetwork(nn.module):
         h, filter_koala_list = self.koala_modules(h, k, filter_koala_list)
         h = self.relu(self.res_blocks(h))
         # upsampling kernel branch
-        self.upsampling_kernel_branch = 
-
+        k2d = self.upsampling_kernel_branch(h)
         # rgb residual image branch
+        rgb = self.rgb_res_img_branch(h)
+        # local filtering and upsampling
+        output_k2d = self.local_conv_us(k2d)
+        output = output_k2d + rgb
 
-
-        return x
+        return output
 
 
 class KOALAModlule(nn.module):
@@ -106,8 +119,22 @@ class CorrectKernelBlock(nn.module):
     def forward(self, x):
         return self.f(x)
 
-# ================ Done =====================
 
+class LocalConvUs(nn.module):
+    def __init__(self, ch, k_sz):
+        super(LocalConvUs, self).__init__()
+        self.ch = ch
+        self.k_sz = k_sz
+        self.image_patches = ExtractSplitStackImagePatches(k_sz, k_sz)
+
+    def forward(self, img, kernel_2d):
+        kernel_2d = kernel_2d.expand(-1, self.ch).permute(0, 3, 1, 2).contiguous()
+        img = self.image_patches(img)
+        y = torch.sum(img * kernel_2d, dim=2) # [B, C, kh*hw, H, W] -> [B, C, H, W]
+        return y
+
+
+## ============= DownsamplingNtowrk =============
 
 class DownsamplingNetwork(nn.module):
     def __init__(self, in_ch, blur_k_sz, n_res):
@@ -128,12 +155,16 @@ class DownsamplingNetwork(nn.module):
                                 )
 
     def forward(self, x):
+        # encoder
         skips = {}
         h, skips[0] = self.enc1(x)
         h, skips[1] = self.enc2(h)
+        # bottleneck
         h = self.Bottlenec(h)
+        # decoder
         h = self.dec1(h, skips[0])
         h = self.dec1(h, skips[1])
+        # downsampling kernel branch
         k2d = self.dec3(h)
 
         return k2d
